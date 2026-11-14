@@ -4,6 +4,7 @@
 #include "gx_internal.h"
 #include "gl_funcs.h"
 #include "gx_glcache.h"
+#include "gx_gles.h"
 #include "gx_glthread.h"
 #include "gx_nis_coef.h"
 #include "sms_gx/gx_pc.h"
@@ -406,6 +407,8 @@ bool rendererReady() { return s_ready; }
 static GLuint compileProgram(const char* vs, const char* fs) {
     auto sh = [](GLenum t, const char* src) {
         GLuint s = glCreateShader(t);
+        std::string adapted = gles::shaderSource(src, t);
+        src = adapted.c_str();
         glShaderSource(s, 1, &src, nullptr);
         glCompileShader(s);
         GLint ok = 0;
@@ -1562,6 +1565,9 @@ void appendDecoded(PrimClass cls, uint32_t fmt, uint32_t stride, const uint8_t* 
 // SMS_GX_DL_ARENA=0 copies them into each batch instead.
 static size_t s_arenaPos = 0;  // from the arena's start
 static uint32_t s_arenaGen = 1;
+#ifdef SMS_GX_HAVE_GLES
+static std::unordered_map<size_t, std::vector<uint32_t>> s_arenaIndices;
+#endif
 
 bool arenaEnabled() {
     static int on = -1;
@@ -1583,12 +1589,18 @@ bool arenaUpload(const uint8_t* verts, uint32_t n, uint32_t stride, const uint32
         glDeleteSync(done);
         s_arenaPos = 0;
         s_arenaGen++;
+#ifdef SMS_GX_HAVE_GLES
+        s_arenaIndices.clear();
+#endif
     }
     const size_t base = s_stream.size;
     const size_t vOff = (base + s_arenaPos + stride - 1) / stride * stride;
     const size_t iOff = (vOff + vbytes + 3) & ~size_t(3);
     s_stream.writeAt(vOff, verts, vbytes);
     s_stream.writeAt(iOff, idx, ibytes);
+#ifdef SMS_GX_HAVE_GLES
+    if (gles::needsRebasedIndices()) s_arenaIndices[iOff].assign(idx, idx + nidx);
+#endif
     s_arenaPos = iOff + ibytes - base;
     out.gen = s_arenaGen;
     out.baseVertex = int32_t(vOff / stride);
@@ -2526,6 +2538,9 @@ void flushBatch() {
         size_t iOff;
         GLsizei count;
         GLint base;
+#ifdef SMS_GX_HAVE_GLES
+        const uint32_t* indices = nullptr;
+#endif
     };
     static std::vector<Range> ranges;
     ranges.clear();
@@ -2537,6 +2552,19 @@ void flushBatch() {
             else ranges.push_back(Range{vaoForFormat(s_bfmt), iOff + size_t(sg.first) * 4, GLsizei(sg.count), streamBase});
         }
     }
+#ifdef SMS_GX_HAVE_GLES
+    if (gles::needsRebasedIndices()) {
+        for (Range& r : ranges) {
+            if (r.iOff < s_stream.size) r.indices = s_bidx.data + (r.iOff - iOff) / 4;
+            else {
+                auto stored = s_arenaIndices.find(r.iOff);
+                if (stored == s_arenaIndices.end() || stored->second.size() < size_t(r.count))
+                    fatal("GLES arena index range is unavailable");
+                r.indices = stored->second.data();
+            }
+        }
+    }
+#endif
     if (earlyFallback) {
         const ShaderProgram* depthSp = shaderForCurrentState(true, s_bclass == PRIM_LINES);
         glcUseProgram(depthSp->prog);
@@ -2569,6 +2597,14 @@ void flushBatch() {
         glColorMask(masks[0], masks[1], masks[2], masks[3]);
         glcUseProgram(sp->prog);
     } else {
+#ifdef SMS_GX_HAVE_GLES
+        for (const Range& r : ranges) {
+            glcBindVertexArray(r.vao);
+            gles::IndexRange indicesRange(r.iOff, r.count, r.base, s_stream.buf, r.indices);
+            glDrawElementsBaseVertex(mode, r.count, GL_UNSIGNED_INT,
+                                     reinterpret_cast<const void*>(indicesRange.offset), indicesRange.base);
+        }
+#else
         // consecutive ranges on one VAO go in one multi-draw
         static std::vector<GLsizei> counts;
         static std::vector<const void*> offsets;
@@ -2594,6 +2630,7 @@ void flushBatch() {
             }
             i = j;
         }
+#endif
     }
     s_stats.draws++;
     s_flushes++;

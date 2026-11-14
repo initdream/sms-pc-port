@@ -6,6 +6,7 @@
 #include "gx_glthread.h"
 #include "gl_funcs.h"
 #include "gx_glcache.h"
+#include "gx_gles.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,6 +46,7 @@ static int s_earlyFragmentTests = -1;
 bool shaderHasEarlyFragmentTests() {
     if (s_earlyFragmentTests >= 0) return s_earlyFragmentTests != 0;
     s_earlyFragmentTests = 0;
+    if (gles::active()) s_earlyFragmentTests = 1;
     GLint n = 0;
     glGetIntegerv(GL_NUM_EXTENSIONS, &n);
     for (GLint i = 0; i < n; i++) {
@@ -359,7 +361,7 @@ static std::string swizzle(uint32_t swap) {
 
 static std::string genFS(const ShaderKey& k) {
     std::string s = kFsHeader;
-    if (k.earlyZ) {
+    if (k.earlyZ & 3) {
         s.insert(s.find('\n') + 1, "#extension GL_ARB_shader_image_load_store : require\nlayout(early_fragment_tests) in;\n");
     }
     if (k.depthOnly) return s + "void main() { o_color = vec4(0.0); }\n";
@@ -605,7 +607,8 @@ static std::string genFS(const ShaderKey& k) {
 // ------------------------------------------------------------------ compile / cache
 static GLuint compile(GLenum type, const std::string& src) {
     GLuint sh = glCreateShader(type);
-    const char* p = src.c_str();
+    std::string adapted = gles::shaderSource(src, type);
+    const char* p = adapted.c_str();
     glShaderSource(sh, 1, &p, nullptr);
     glCompileShader(sh);
     GLint ok = 0;
@@ -613,7 +616,7 @@ static GLuint compile(GLenum type, const std::string& src) {
     if (!ok) {
         char log[4096];
         glGetShaderInfoLog(sh, sizeof log, nullptr, log);
-        logmsg("shader compile failed:\n%s\n--- source ---\n%s", log, src.c_str());
+        logmsg("shader compile failed:\n%s\n--- source ---\n%s", log, adapted.c_str());
     }
     return sh;
 }
@@ -676,7 +679,9 @@ static void setupProgram(GLuint p, ShaderProgram& sp, bool aside = false) {
 }
 
 static uint64_t sourceHash(const std::string& vs, const std::string& fs) {
-    return hashBytes(vs.data(), vs.size(), 0x5348u) ^ hashBytes(fs.data(), fs.size(), 0x4653u) * 0x9E3779B97F4A7C15ull;
+    const std::string vertex = gles::shaderSource(vs, GL_VERTEX_SHADER);
+    const std::string fragment = gles::shaderSource(fs, GL_FRAGMENT_SHADER);
+    return hashBytes(vertex.data(), vertex.size(), 0x5348u) ^ hashBytes(fragment.data(), fragment.size(), 0x4653u) * 0x9E3779B97F4A7C15ull;
 }
 
 // ------------------------------------------------------------------ program cache
@@ -899,7 +904,8 @@ static std::vector<Warmed> s_warmed;
 
 static GLuint startCompile(GLenum type, const std::string& src) {
     GLuint sh = glCreateShader(type);
-    const char* p = src.c_str();
+    std::string adapted = gles::shaderSource(src, type);
+    const char* p = adapted.c_str();
     glShaderSource(sh, 1, &p, nullptr);
     glCompileShader(sh);
     return sh;
@@ -1147,6 +1153,7 @@ static std::string genLineGS() {
 }
 
 static std::unordered_map<ProgramKey, ShaderProgram, ProgramKeyHash> s_linePrograms;
+static bool s_lineProgramsFailed = false;
 
 static const ShaderProgram* lineProgram(const ProgramKey& key) {
     auto it = s_linePrograms.find(key);
@@ -1168,28 +1175,36 @@ static const ShaderProgram* lineProgram(const ProgramKey& key) {
         if (!ok) {
             char log[4096];
             glGetProgramInfoLog(p, sizeof log, nullptr, log);
-            logmsg("line program link failed: %s", log);
+            logmsg("line program link failed, drawing lines one pixel wide: %s", log);
         }
         glDeleteShader(v);
         glDeleteShader(gm);
         glDeleteShader(f);
+        if (!ok) {
+            glDeleteProgram(p);
+            s_lineProgramsFailed = true;
+            return;
+        }
         sp.id = int(g_statShaderCompiles);
         setupProgram(p, sp);
     });
+    if (s_lineProgramsFailed) return nullptr;
     return &(s_linePrograms[key] = sp);
 }
 
-const ShaderProgram* shaderForCurrentState(bool depthOnly, bool lines) {
+const ShaderProgram* shaderForCurrentState(bool depthOnly, bool lines, bool metric) {
     if (s_cacheState < 0) shaderSetup();
     ProgramKey key;
     ShaderKey& k = key.k;
     buildKey(k);
     k.depthOnly = depthOnly;
+    (void)metric;
     if (depthOnly || lines)  // nothing to tint: their programs are as ever
         for (uint32_t st = 0; st < 16; st++) k.order[st] &= ~(kOrderGoop | kOrderTint);
     key.indScale[0] = k.numInd ? g.bp[BP_RAS1_SS0] : 0;
     key.indScale[1] = k.numInd ? g.bp[BP_RAS1_SS0 + 1] : 0;
-    if (lines) return lineProgram(key);
+    if (lines && !s_lineProgramsFailed && gles::geometryShaders())
+        if (const ShaderProgram* sp = lineProgram(key)) return sp;
     // consecutive batches mostly share a program
     if (s_lastProgram && key == s_lastKey) return s_lastProgram;
     recordKey(key);

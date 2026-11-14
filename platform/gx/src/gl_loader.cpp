@@ -6,6 +6,7 @@
 #include <vector>
 #include "gx_internal.h"
 #include "gx_glthread.h"
+#include "gx_gles.h"
 #include <type_traits>
 
 namespace gx { namespace gl {
@@ -64,12 +65,13 @@ bool load(void* (*getProc)(const char*)) {
     bool ok = true;
 #define SMS_GX_LOAD(type, name)                                   \
     gx_##name = reinterpret_cast<type>(getProc(#name));           \
-    if (!gx_##name) { gx::logmsg("GL entry point missing: %s", #name); ok = false; }
+    if (!gx_##name && !gx::gles::desktopEntry(#name)) { gx::logmsg("GL entry point missing: %s", #name); ok = false; }
     SMS_GX_GL_FUNCS(SMS_GX_LOAD)
 #undef SMS_GX_LOAD
 #define SMS_GX_LOAD_OPTIONAL(type, name) gx_##name = reinterpret_cast<type>(getProc(#name));
     SMS_GX_GL_OPTIONAL_FUNCS(SMS_GX_LOAD_OPTIONAL)
 #undef SMS_GX_LOAD_OPTIONAL
+    if (ok && gx::gles::active()) gx::gles::install(getProc);
 #if !(defined(_WIN32) && !defined(_WIN64))
     if (getenv("SMS_GX_STATS")) {
 #define SMS_GX_WRAP(type, name)                                   \

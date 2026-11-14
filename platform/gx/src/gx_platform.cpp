@@ -13,6 +13,7 @@
 #include "gx_coop_overlay.h"
 #include "gx_ext_overlay.h"
 #include "gx_glthread.h"
+#include "gx_gles.h"
 #include "gx_window_layout.h"
 #include "sms_gx/gx_pc.h"
 
@@ -101,6 +102,15 @@ bool s_vulkan = false;  // the backend in use is Vulkan
 // log it is a notice in the window for a while (showVulkanNotice) and a line in
 // the debug overlay (gx::vulkanMissing).
 std::string s_vulkanMissing;
+int s_wantGles = -1;  // -1: from the environment
+bool s_gles = false;  // the backend in use is OpenGL ES
+bool wantGles() {
+    if (s_wantGles < 0) {
+        const char* e = getenv("SMS_GX_BACKEND");
+        s_wantGles = e && !strcmp(e, "gles");
+    }
+    return s_wantGles == 1;
+}
 bool wantVulkan() {
     if (s_wantVulkan < 0) {
         const char* e = getenv("SMS_GX_BACKEND");
@@ -537,7 +547,7 @@ void expireVulkanNotice() {
     gx::extOverlayClearIf(GXPC_EXT_OVERLAY_NOTICE, s_vulkanNotice);
 }
 
-bool openWindow(float scale, bool vulkan) {
+bool openWindow(float scale, bool vulkan, bool gles) {
 #ifdef SDL_HINT_WINDOWS_DPI_SCALING
     SDL_SetHint(SDL_HINT_WINDOWS_DPI_SCALING, "1");
 #endif
@@ -571,8 +581,13 @@ bool openWindow(float scale, bool vulkan) {
     s_windowFailure = WF_WINDOW;
     if (!vulkan) {
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
-        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
-        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+        if (gles) {
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+        } else {
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+        }
         SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
     }
     // Open on the monitor containing the pointer (usually the launcher's Play
@@ -683,6 +698,8 @@ bool openWindow(float scale, bool vulkan) {
         scale = fsrScale(scale, outW, outH);
     }
     s_vulkan = vulkan;
+    s_gles = gles;
+    gles::setActive(gles);
 #ifdef SMS_GX_HAVE_VULKAN
     const bool started = GXPC_Init(vulkan ? vkGetProc : sdlGetProc, scale);
 #else
@@ -828,12 +845,17 @@ bool openWindowAnyBackend(float scale) {
     findDesktop();
 #endif
     if (wantVulkan()) {
-        if (openWindow(scale, true)) return true;
+        if (openWindow(scale, true, false)) return true;
         if (s_windowFailure != WF_WINDOW) return false;
         logmsg("Vulkan could not start (%s); OpenGL instead", s_windowError);
         s_vulkanMissing = std::string("Vulkan could not start: ") + s_windowError;
     }
-    if (openWindow(scale, false)) return true;
+    if (wantGles()) {
+        if (openWindow(scale, false, true)) return true;
+        if (s_windowFailure != WF_WINDOW) return false;
+        logmsg("OpenGL ES could not start (%s); OpenGL instead", s_windowError);
+    }
+    if (openWindow(scale, false, false)) return true;
 #if !defined(_WIN32) && !defined(__APPLE__)
     if (s_windowFailure != WF_WINDOW) return false;
     const char* other = !strcmp(s_videoDriver, "wayland") ? "x11" : !strcmp(s_videoDriver, "x11") ? "wayland" : nullptr;
@@ -841,7 +863,7 @@ bool openWindowAnyBackend(float scale) {
         const std::string first = s_videoDriver, firstError = s_windowError;
         logmsg("no window on %s (%s); trying %s", first.c_str(), firstError.c_str(), other);
         forceVideoDriver(other);
-        if (openWindow(scale, false)) return true;
+        if (openWindow(scale, false, false)) return true;
         snprintf(s_windowError, sizeof s_windowError, "%s: %s; %s: %s", first.c_str(), firstError.c_str(), other,
                  std::string(s_windowError).c_str());
         s_windowFailure = WF_WINDOW;
@@ -854,17 +876,28 @@ bool openWindowAnyBackend(float scale) {
 #ifdef SMS_GX_HAVE_EGL
 void* eglGetProc(const char* name) { return reinterpret_cast<void*>(eglGetProcAddress(name)); }
 
-bool tryEglDisplay(EGLDisplay dpy) {
+bool tryEglDisplay(EGLDisplay dpy, bool gles) {
     EGLint major, minor;
     if (dpy == EGL_NO_DISPLAY || !eglInitialize(dpy, &major, &minor)) return false;
-    if (!eglBindAPI(EGL_OPENGL_API)) return false;
-    const EGLint cfgAttr[] = {EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT, EGL_NONE};
+    if (gles) {
+        if (!eglBindAPI(EGL_OPENGL_ES_API)) return false;
+    } else {
+        if (!eglBindAPI(EGL_OPENGL_API)) return false;
+    }
+    const EGLint cfgAttr[] = {EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_RENDERABLE_TYPE,
+                              gles ? EGL_OPENGL_ES3_BIT : EGL_OPENGL_BIT, EGL_NONE};
     EGLConfig cfg;
     EGLint n = 0;
     if (!eglChooseConfig(dpy, cfgAttr, &cfg, 1, &n) || n < 1) return false;
-    const EGLint ctxAttr[] = {EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 3,
-                              EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT, EGL_NONE};
-    EGLContext ctx = eglCreateContext(dpy, cfg, EGL_NO_CONTEXT, ctxAttr);
+    EGLContext ctx = EGL_NO_CONTEXT;
+    if (gles) {
+        const EGLint ctxAttr[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
+        ctx = eglCreateContext(dpy, cfg, EGL_NO_CONTEXT, ctxAttr);
+    } else {
+        const EGLint ctxAttr[] = {EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 3,
+                                  EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT, EGL_NONE};
+        ctx = eglCreateContext(dpy, cfg, EGL_NO_CONTEXT, ctxAttr);
+    }
     if (ctx == EGL_NO_CONTEXT) return false;
     if (eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx)) return true;
     // no surfaceless support: fall back to a tiny pbuffer
@@ -873,7 +906,7 @@ bool tryEglDisplay(EGLDisplay dpy) {
     return pb != EGL_NO_SURFACE && eglMakeCurrent(dpy, pb, pb, ctx);
 }
 
-bool openHeadless(float scale) {
+bool openHeadless(float scale, bool gles) {
     auto getPlatformDisplay = reinterpret_cast<PFNEGLGETPLATFORMDISPLAYEXTPROC>(eglGetProcAddress("eglGetPlatformDisplayEXT"));
     auto queryDevices = reinterpret_cast<PFNEGLQUERYDEVICESEXTPROC>(eglGetProcAddress("eglQueryDevicesEXT"));
     bool ok = false;
@@ -883,15 +916,17 @@ bool openHeadless(float scale) {
         EGLDeviceEXT devs[8];
         EGLint n = 0;
         if (queryDevices(8, devs, &n))
-            for (EGLint i = 0; i < n && !ok; i++) ok = tryEglDisplay(getPlatformDisplay(EGL_PLATFORM_DEVICE_EXT, devs[i], nullptr));
+            for (EGLint i = 0; i < n && !ok; i++) ok = tryEglDisplay(getPlatformDisplay(EGL_PLATFORM_DEVICE_EXT, devs[i], nullptr), gles);
     }
     if (!ok && getPlatformDisplay)
-        ok = tryEglDisplay(getPlatformDisplay(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, nullptr));
-    if (!ok) ok = tryEglDisplay(eglGetDisplay(EGL_DEFAULT_DISPLAY));
+        ok = tryEglDisplay(getPlatformDisplay(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, nullptr), gles);
+    if (!ok) ok = tryEglDisplay(eglGetDisplay(EGL_DEFAULT_DISPLAY), gles);
     if (!ok) {
-        logmsg("headless: no EGL OpenGL 3.3 context (try LIBGL_ALWAYS_SOFTWARE=1)");
+        logmsg("headless: no EGL %s context (try LIBGL_ALWAYS_SOFTWARE=1)", gles ? "OpenGL ES" : "OpenGL 3.3");
         return false;
     }
+    s_gles = gles;
+    gles::setActive(gles);
     if (!GXPC_Init(eglGetProc, scale)) return false;
     // the context moves to the GL thread (gx_glthread.h)
     static EGLDisplay dpy;
@@ -964,6 +999,9 @@ const char* vulkanMissing() { return s_vulkanMissing.c_str(); }
 bool platformGeometryShaders() {
 #ifdef SMS_GX_HAVE_VULKAN
     if (s_vulkan) return glvk::geometryShaders();
+#endif
+#ifdef SMS_GX_HAVE_GLES
+    if (s_gles) return gles::geometryShaders();
 #endif
     return true;  // OpenGL 3.3 core
 }
@@ -1303,7 +1341,12 @@ int GXPC_InitAuto(float efbScale) {
     }
 #endif
 #ifdef SMS_GX_HAVE_EGL
-    if (openHeadless(efbScale)) {
+    if (wantGles() && openHeadless(efbScale, true)) {
+        s_mode = MODE_HEADLESS;
+        logmsg("headless OpenGL ES context ready");
+        return 1;
+    }
+    if (openHeadless(efbScale, false)) {
         s_mode = MODE_HEADLESS;
         logmsg("headless OpenGL context ready");
         return 1;

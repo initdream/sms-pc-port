@@ -377,7 +377,7 @@ bool shaderHasEarlyFragmentTests();
 bool earlyZWritesRejected();
 // `lines`: the program for a line batch, which draws each line as a quad
 // GXSetLineWidth wide (a geometry shader)
-const ShaderProgram* shaderForCurrentState(bool depthOnly = false, bool lines = false);
+const ShaderProgram* shaderForCurrentState(bool depthOnly = false, bool lines = false, bool metric = false);
 // The texture map whose goop layer the current state's program tints
 // (GXPC_SetGoopTint), as the last shaderForCurrentState saw it; -1 none.
 int goopMapNow();

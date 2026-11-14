@@ -6,6 +6,7 @@ set(SMS_DECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../decomp" CACHE PATH "Path t
 # The decomp's game headers and the SDK's (libs/dolphin/include).
 set(SMS_GX_DECOMP_INCLUDE ${SMS_DECOMP_DIR}/include ${SMS_DECOMP_DIR}/libs/dolphin/include)
 option(SMS_GX_BUILD_TESTS "Build the headless self-test" ON)
+option(SMS_GX_GLES "Build the OpenGL ES renderer" OFF)
 
 set(SMS_GX_SOURCES
     src/gl_loader.cpp
@@ -28,6 +29,9 @@ set(SMS_GX_SOURCES
     src/gx_texture.cpp
     src/gx_trace.cpp
     src/gx_vert.cpp)
+if(SMS_GX_GLES)
+    list(APPEND SMS_GX_SOURCES src/gx_gles.cpp)
+endif()
 
 # GD is compiled from the decompiled SDK sources: it only emits command bytes.
 set(SMS_GX_GD_SOURCES
@@ -70,6 +74,9 @@ target_compile_features(sms_gx PRIVATE cxx_std_17)
 # fuse a multiply-add (GCC and Clang do on arm64 by default; x86 builds
 # without -mfma never fuse, so their code does not change).
 target_compile_options(sms_gx PRIVATE -ffp-contract=off)
+if(SMS_GX_GLES)
+    target_compile_definitions(sms_gx PRIVATE SMS_GX_HAVE_GLES=1)
+endif()
 set_target_properties(sms_gx PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # Window (SDL2) and headless (EGL) context creation; both optional so the
 # library still builds where only a host-supplied context is used.
