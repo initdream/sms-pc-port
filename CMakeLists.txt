@@ -58,8 +58,10 @@ if(SMS_ARCH STREQUAL "auto")
     message(WARNING "-m32 does not link here (install gcc-multilib g++-multilib); building -m64")
   endif()
 endif()
-add_compile_options(-m${SMS_ARCH})
-add_link_options(-m${SMS_ARCH})
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|i.86)$")
+  add_compile_options(-m${SMS_ARCH})
+  add_link_options(-m${SMS_ARCH})
+endif()
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   # RUNPATH, not RPATH: a toolchain's library directory (the launcher's conda
   # tools add one to every link) then finds only the game's own libraries.
