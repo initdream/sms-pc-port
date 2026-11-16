@@ -77,6 +77,11 @@ target_compile_options(sms_gx PRIVATE -ffp-contract=off)
 if(SMS_GX_GLES)
     target_compile_definitions(sms_gx PRIVATE SMS_GX_HAVE_GLES=1)
 endif()
+if(TARGET starlet_gx_gles)
+    target_compile_definitions(sms_gx PRIVATE SMS_GX_HAVE_STARLET=1)
+    target_link_libraries(sms_gx PUBLIC starlet::gx_gles)
+    message(STATUS "sms_gx: starlet renderer (SMS_GX_BACKEND=starlet)")
+endif()
 set_target_properties(sms_gx PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # Window (SDL2) and headless (EGL) context creation; both optional so the
 # library still builds where only a host-supplied context is used.

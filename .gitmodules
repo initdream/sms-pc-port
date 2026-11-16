@@ -6,3 +6,6 @@
 	path = sdk
 	url = https://github.com/chasem-dev/sms-mod-sdk.git
 	branch = main
+[submodule "thirdparty/starlet"]
+	path = thirdparty/starlet
+	url = https://github.com/Producdevity/starlet

@@ -296,6 +296,13 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND SMS_WITH_GX AND SMS_ARCH STREQUAL 
     set(SMS_GX_EGL_INCLUDE /usr/include CACHE PATH "" FORCE)
   endif()
 endif()
+option(SMS_GX_STARLET "Build and link the starlet GX renderer (SMS_GX_BACKEND=starlet)" OFF)
+if(SMS_WITH_GX AND SMS_GX_STARLET AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+   EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/starlet/CMakeLists.txt)
+  set(STARLET_GLES ON CACHE BOOL "" FORCE)
+  set(STARLET_TESTS OFF CACHE BOOL "" FORCE)
+  add_subdirectory(thirdparty/starlet EXCLUDE_FROM_ALL)
+endif()
 if(SMS_WITH_GX AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/platform/gx/CMakeLists.txt)
   add_subdirectory(platform/gx)
 endif()

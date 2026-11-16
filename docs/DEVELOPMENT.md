@@ -327,6 +327,7 @@ The everyday options are in the [README](../README.md#options); this is the full
 | `SMS_GX_*` | graphics switches (`platform/gx/README.md`) |
 | `SMS_GX_BACKEND=none` | no renderer at all: nothing is drawn, read-backs see an empty frame (the [dedicated server](../BUILD.md#dedicated-server)) |
 | `SMS_GX_BACKEND=vulkan`, `SMS_VK_*` | the Vulkan backend and its switches (device, validation, frames in flight, MoltenVK library, portability test): [VULKAN.md](VULKAN.md) |
+| `SMS_GX_BACKEND=starlet` | the starlet renderer (`thirdparty/starlet`, GPL-3): an alternate GX renderer core on its own OpenGL ES 3.1 context, Linux ARM handhelds first; needs a build with `SMS_GX_STARLET=ON`, else OpenGL |
 
 ## Progress log
 

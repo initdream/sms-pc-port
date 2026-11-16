@@ -111,6 +111,24 @@ bool wantGles() {
     }
     return s_wantGles == 1;
 }
+int s_wantStarlet = -1;
+bool s_starlet = false;
+bool wantStarlet() {
+    if (s_wantStarlet < 0) {
+        const char* e = getenv("SMS_GX_BACKEND");
+        s_wantStarlet = e && !strcmp(e, "starlet");
+    }
+#ifdef SMS_GX_HAVE_STARLET
+    return s_wantStarlet == 1;
+#else
+    static bool told = false;
+    if (s_wantStarlet == 1 && !told) {
+        told = true;
+        gx::logmsg("starlet was asked for, but this build has no starlet renderer; OpenGL instead");
+    }
+    return false;
+#endif
+}
 bool wantVulkan() {
     if (s_wantVulkan < 0) {
         const char* e = getenv("SMS_GX_BACKEND");
@@ -850,6 +868,15 @@ bool openWindowAnyBackend(float scale) {
         logmsg("Vulkan could not start (%s); OpenGL instead", s_windowError);
         s_vulkanMissing = std::string("Vulkan could not start: ") + s_windowError;
     }
+    if (wantStarlet()) {
+        if (openWindow(scale, false, true)) {
+            s_starlet = true;
+            logmsg("starlet renderer (SMS_GX_BACKEND=starlet)");
+            return true;
+        }
+        if (s_windowFailure != WF_WINDOW) return false;
+        logmsg("the starlet renderer could not start (%s); OpenGL instead", s_windowError);
+    }
     if (wantGles()) {
         if (openWindow(scale, false, true)) return true;
         if (s_windowFailure != WF_WINDOW) return false;
@@ -996,6 +1023,7 @@ void onDisplayCopy(const void* xfb) {
 
 namespace gx {
 const char* vulkanMissing() { return s_vulkanMissing.c_str(); }
+bool starletBackend() { return s_starlet; }
 bool platformGeometryShaders() {
 #ifdef SMS_GX_HAVE_VULKAN
     if (s_vulkan) return glvk::geometryShaders();
@@ -1341,6 +1369,12 @@ int GXPC_InitAuto(float efbScale) {
     }
 #endif
 #ifdef SMS_GX_HAVE_EGL
+    if (wantStarlet() && openHeadless(efbScale, true)) {
+        s_starlet = true;
+        s_mode = MODE_HEADLESS;
+        logmsg("headless starlet renderer (OpenGL ES context) ready");
+        return 1;
+    }
     if (wantGles() && openHeadless(efbScale, true)) {
         s_mode = MODE_HEADLESS;
         logmsg("headless OpenGL ES context ready");
