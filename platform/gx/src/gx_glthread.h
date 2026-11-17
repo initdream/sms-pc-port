@@ -43,6 +43,7 @@ void publish();
 void waitFlag(const std::atomic<int>& done);
 void signalFlag(std::atomic<int>& done);
 void finish();  // waits until everything queued so far has run
+void kick();
 
 template <class F> void callThunk(void* p) { (*static_cast<F*>(p))(); }
 

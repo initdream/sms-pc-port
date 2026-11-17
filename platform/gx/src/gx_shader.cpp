@@ -364,6 +364,8 @@ static std::string genFS(const ShaderKey& k) {
     if (k.earlyZ & 3) {
         s.insert(s.find('\n') + 1, "#extension GL_ARB_shader_image_load_store : require\nlayout(early_fragment_tests) in;\n");
     }
+    if (gles::active() && (k.earlyZ & 2))
+        s += "layout(std430, binding=0) buffer SmsMetric { uint smsMetricSamples; };\n";
     if (k.depthOnly) return s + "void main() { o_color = vec4(0.0); }\n";
     char buf[2048];
     int goopStage = -1;  // its result tinted by a goop layer's tint map (GXPC_SetGoopTint)
@@ -377,6 +379,7 @@ static std::string genFS(const ShaderKey& k) {
          "  ivec4 ras0 = texi(v_c0), ras1 = texi(v_c1);\n"
          "  ivec4 tex = ivec4(255), ras = ivec4(0), konst = ivec4(0);\n"
          "  int bumpA = 0; vec2 prevTc = vec2(0.0);\n";
+    if (gles::active() && (k.earlyZ & 3) == 3) s += "  atomicAdd(smsMetricSamples, 1u);\n";
     // indirect texture lookups
     for (uint32_t i = 0; i < k.numInd; i++) {
         uint32_t map = (k.iref >> (6 * i)) & 7, coord = (k.iref >> (6 * i + 3)) & 7;
@@ -600,6 +603,7 @@ static std::string genFS(const ShaderKey& k) {
         }
         s += "  color.rgb = mix(color.rgb, u_fogcolor.rgb, f);\n";
     }
+    if (gles::active() && (k.earlyZ & 3) == 2) s += "  atomicAdd(smsMetricSamples, 1u);\n";
     s += "  o_color = color;\n}\n";
     return s;
 }
@@ -1198,7 +1202,7 @@ const ShaderProgram* shaderForCurrentState(bool depthOnly, bool lines, bool metr
     ShaderKey& k = key.k;
     buildKey(k);
     k.depthOnly = depthOnly;
-    (void)metric;
+    if (gles::active() && metric) k.earlyZ |= 2;
     if (depthOnly || lines)  // nothing to tint: their programs are as ever
         for (uint32_t st = 0; st < 16; st++) k.order[st] &= ~(kOrderGoop | kOrderTint);
     key.indScale[0] = k.numInd ? g.bp[BP_RAS1_SS0] : 0;

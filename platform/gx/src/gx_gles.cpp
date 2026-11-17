@@ -238,7 +238,7 @@ void replace(std::string& s, const std::string& from, const std::string& to) {
 
 void setActive(bool on) { s_active = on; }
 bool active() { return s_active; }
-bool metricActive() { return s_active && metricOn; }
+bool metricActive() { return metricOn; }
 bool geometryShaders() { return !s_active || geometryExtension != nullptr; }
 void memoryBarrier(unsigned bits) { if (s_active) entry<PFNGLMEMORYBARRIERPROC>("glMemoryBarrier")(GLbitfield(bits)); }
 bool needsRebasedIndices() { return s_active && drawBase == rebaseDraw; }

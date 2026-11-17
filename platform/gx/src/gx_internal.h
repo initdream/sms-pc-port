@@ -267,6 +267,9 @@ void appendArena(PrimClass cls, uint32_t fmt, uint32_t stride, const ArenaRef& r
 bool batchUsesArena();
 void onStateChange();  // called before any register write that changes state
 void executeCopy(uint32_t execReg);
+void serviceWriteBacks(bool wait);
+extern void (*g_displayCopyHook)(const void* xfb);
+extern void (*drawSyncCallback)(uint16_t);
 void markXfMemDirty();
 uint32_t peekColor(int x, int y);  // A<<24|R<<16|G<<8|B
 uint32_t peekZ(int x, int y);      // 24-bit

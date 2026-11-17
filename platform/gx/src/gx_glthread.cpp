@@ -194,6 +194,8 @@ void finish() {
     mainWait([&] { return s_tail.load(std::memory_order_acquire) >= upto; });
 }
 
+void kick() { wakeGl(); }
+
 bool start(void (*bind)(void*), void* arg) {
     if (s_running.load() || !enabled()) return false;
     if (!s_ring) {

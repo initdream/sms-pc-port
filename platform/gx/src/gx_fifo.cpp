@@ -241,11 +241,13 @@ void writeBP(uint32_t value) {
         g.drawSyncToken = uint16_t(data & 0xFFFF);
         if (reg == BP_PE_TOKEN_INT && drawSyncCallback) {
             flushBatch();
+            serviceWriteBacks(false);
             drawSyncCallback(g.drawSyncToken);
         }
         return;
     case BP_DRAWDONE:
         flushBatch();
+        serviceWriteBacks(false);
         g.bp[reg] = data;
         return;
     case BP_LOADTLUT1: {

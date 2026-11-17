@@ -16,6 +16,10 @@
 #include <time.h>
 #include <string.h>
 #include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
 #include <unordered_map>
 
 namespace gx {
@@ -520,6 +524,7 @@ uniform vec4 u_map;    // CopyMap: where the copy's left and top edges fall in t
 uniform vec2 u_step;   // and EFB pixels per copy texel
 uniform int u_layout;  // copyLayout: 0 I4, 1 I8, 2 IA4, 3 IA8, 4 RGB565, 5 RGB5A3, 6 RGBA8
 uniform int u_bytes;
+uniform int u_base;
 out vec4 o_color;
 uvec4 texel(int x, int y) {
   if (x >= u_size.x || y >= u_size.y) return uvec4(0u);
@@ -561,13 +566,13 @@ uint byteAt(int b) {
   return lo ? t.b : t.g;
 }
 void main() {
-  int k = (int(gl_FragCoord.y) * 256 + int(gl_FragCoord.x)) * 4;
+  int k = ((int(gl_FragCoord.y) - u_base) * 256 + int(gl_FragCoord.x)) * 4;
   o_color = vec4(float(byteAt(k)), float(byteAt(k + 1)), float(byteAt(k + 2)), float(byteAt(k + 3))) / 255.0;
 }
 )";
 static GLuint s_encProg, s_encFbo, s_encTex;
 static GLint s_encUMap, s_encUStep;
-static GLint s_encUSize, s_encULayout, s_encUBytes;
+static GLint s_encUSize, s_encULayout, s_encUBytes, s_encUBase;
 static int s_encRows = 0;
 
 // ------------------------------------------------------------ post-processing
@@ -1455,6 +1460,7 @@ void rendererInit(float efbScale) {
     s_encUStep = glGetUniformLocation(s_encProg, "u_step");
     s_encULayout = glGetUniformLocation(s_encProg, "u_layout");
     s_encUBytes = glGetUniformLocation(s_encProg, "u_bytes");
+    s_encUBase = glGetUniformLocation(s_encProg, "u_base");
     glGenFramebuffers(1, &s_encFbo);
     glGenVertexArrays(1, &s_copyVao);
     postInit();
@@ -1942,6 +1948,7 @@ static void uploadUniforms(const ShaderProgram* sp, float texW[8], float texH[8]
 
 static uint32_t s_syncReads = 0;  // reads that made the CPU wait for the GPU
 static uint64_t s_flushes = 0;    // flushBatch calls that drew
+static uint32_t s_wbLands = 0, s_wbDrops = 0, s_wbWaits = 0;
 static void statsFrame() {
     static int every = -1;
     static uint32_t frames = 0, draws = 0, verts = 0, compiles0 = 0, uploads0 = 0, sync0 = 0;
@@ -1978,6 +1985,12 @@ static void statsFrame() {
            double(g_statTexHashBytes - hash0) / 1024.0 / frames, double(g_statTexInvalidates - inv0) / frames,
            (g_decodeSeconds - dec0) * 1000.0 / frames, ((s_idleClock ? s_idleClock() : 0) - idle0) * 1000.0 / frames);
     gl::logTopCalls(frames);
+    static uint32_t wb0 = 0, wbd0 = 0, wbw0 = 0;
+    logmsg("stats: %u copy write-backs stored (%u dropped, %u waited)",
+           s_wbLands - wb0, s_wbDrops - wbd0, s_wbWaits - wbw0);
+    wb0 = s_wbLands;
+    wbd0 = s_wbDrops;
+    wbw0 = s_wbWaits;
     dec0 = g_decodeSeconds;
     idle0 = s_idleClock ? s_idleClock() : 0;
     gl0 = gl::g_statGlCalls;
@@ -2565,6 +2578,56 @@ void flushBatch() {
         }
     }
 #endif
+#ifdef SMS_GX_HAVE_GLES
+    if (s_pixActive && gles::metricActive()) {
+        const ShaderProgram* metricSp = shaderForCurrentState(false, s_bclass == PRIM_LINES, true);
+        glcUseProgram(metricSp->prog);
+        uploadUniforms(metricSp, texW, texH);
+        const ShaderProgram* depthSp = nullptr;
+        if (earlyFallback) {
+            depthSp = shaderForCurrentState(true, s_bclass == PRIM_LINES);
+            glcUseProgram(depthSp->prog);
+            uploadUniforms(depthSp, texW, texH);
+        }
+        GLboolean masks[4];
+        memcpy(masks, g_glc.cmask, sizeof masks);
+        const GLboolean depthMask = g_glc.depthMask;
+        const uint32_t alphaFunc = (g.bp[BP_ALPHACOMPARE] >> 16) & 0xFF;
+        const bool ordered = earlyFallback || (depthMask && !earlyZWritesRejected() &&
+                                               alphaFunc != 0x3F && alphaFunc != 0x7F);
+        const size_t step = s_bclass == PRIM_TRIS ? 3 : s_bclass == PRIM_LINES ? 2 : 1;
+        for (const Range& r : ranges) {
+            glcBindVertexArray(r.vao);
+            gles::IndexRange indicesRange(r.iOff, r.count, r.base, s_stream.buf, r.indices);
+            if (!ordered) {
+                glcUseProgram(metricSp->prog);
+                glDrawElementsBaseVertex(mode, r.count, GL_UNSIGNED_INT,
+                                         reinterpret_cast<const void*>(indicesRange.offset), indicesRange.base);
+                continue;
+            }
+            for (size_t i = 0; i < size_t(r.count); i += step) {
+                const void* indices = reinterpret_cast<const void*>(indicesRange.offset + i * 4);
+                glcUseProgram(metricSp->prog);
+                glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+                glDepthMask(GL_FALSE);
+                glDrawElementsBaseVertex(mode, GLsizei(step), GL_UNSIGNED_INT, indices, indicesRange.base);
+                glcUseProgram(sp->prog);
+                glColorMask(masks[0], masks[1], masks[2], masks[3]);
+                glDepthMask(earlyFallback ? GL_FALSE : depthMask);
+                glDrawElementsBaseVertex(mode, GLsizei(step), GL_UNSIGNED_INT, indices, indicesRange.base);
+                if (earlyFallback) {
+                    glcUseProgram(depthSp->prog);
+                    glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+                    glDepthMask(GL_TRUE);
+                    glDrawElementsBaseVertex(mode, GLsizei(step), GL_UNSIGNED_INT, indices, indicesRange.base);
+                }
+            }
+        }
+        glColorMask(masks[0], masks[1], masks[2], masks[3]);
+        glDepthMask(depthMask);
+        glcUseProgram(sp->prog);
+    } else
+#endif
     if (earlyFallback) {
         const ShaderProgram* depthSp = shaderForCurrentState(true, s_bclass == PRIM_LINES);
         glcUseProgram(depthSp->prog);
@@ -2730,7 +2793,6 @@ static bool copyWriteBackEnabled() {
     return on != 0;
 }
 
-// Stores a write-back's encoded bytes (n of them) at its destination.
 static void storeEncoded(const uint8_t* enc, const void* dest, uint32_t n) {
     static int logCopies = -1;
     if (logCopies < 0) logCopies = getenv("SMS_GX_COPY_LOG") ? atoi(getenv("SMS_GX_COPY_LOG")) : 0;
@@ -2762,20 +2824,21 @@ static int copyTexelFor(int t, float f, float per, float step, int n) {
 // Encodes the copy in `tex` (ow x oh) as tw x th texels of `layout` into
 // s_encTex and leaves s_encFbo bound for reading; returns the rows (of 256
 // pixels, 1 KiB) that hold the `bytes`.
-static int encodeCopy(GLuint tex, int ow, int oh, int tw, int th, const CopyMap& map, uint32_t layout, uint32_t bytes) {
+static int encodeCopy(GLuint tex, int ow, int oh, int tw, int th, const CopyMap& map, uint32_t layout, uint32_t bytes,
+                      int base) {
     const int rows = int((bytes + 1023) / 1024);
-    if (rows > s_encRows) {
+    if (base + rows > s_encRows) {
         if (!s_encTex) glGenTextures(1, &s_encTex);
         glBindTexture(GL_TEXTURE_2D, s_encTex);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 256, rows, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 256, base + rows, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
         glBindFramebuffer(GL_FRAMEBUFFER, s_encFbo);
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s_encTex, 0);
-        s_encRows = rows;
+        s_encRows = base + rows;
     }
     glBindFramebuffer(GL_FRAMEBUFFER, s_encFbo);
-    glViewport(0, 0, 256, rows);
+    glViewport(0, base, 256, rows);
     glUseProgram(s_encProg);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, tex);
@@ -2787,6 +2850,7 @@ static int encodeCopy(GLuint tex, int ow, int oh, int tw, int th, const CopyMap&
     glUniform2f(s_encUStep, map.stepX, map.stepY);
     glUniform1i(s_encULayout, GLint(layout));
     glUniform1i(s_encUBytes, GLint(bytes));
+    glUniform1i(s_encUBase, base);
     glBindVertexArray(s_copyVao);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     glBindVertexArray(s_vao);
@@ -2831,72 +2895,307 @@ static void verifyEncode(GLuint tex, int ow, int oh, int tw, int th, const CopyM
     glPixelStorei(GL_PACK_ALIGNMENT, 4);
 }
 
-// A texture copy's write-back is read into a pixel buffer and stored one
-// frame later, when the GPU has long finished it (or earlier, when the next
-// copy to the same place comes). It is dropped when a newer copy of the same
-// frame supersedes it or when the destination's bytes
-// changed in the meantime (the CPU wrote them, or a stage load reused the
-// memory). A cache flush of the range alone does not drop it: games flush
-// copy destinations without writing them.
-// With the GL thread, it reads a frame's write-backs once that frame is
-// shown (prefetchWriteBacks), so storing one later does not wait for it.
-struct WbFetch {
-    std::atomic<int> ready{0};
-    bool ok = false;
-    std::vector<uint8_t> bytes;
+struct WbBatch {
+    GLuint pbo = 0;
+    bool sized = false;
+    int rows = 0;
+    GLsync fence = nullptr;
+    std::atomic<int> copied{0};
+    std::atomic<int> dropped{0};
+    std::atomic<int> collectQueued{0};
+    std::atomic<int> handed{0};
+    std::atomic<int> mapped{0};
+    std::atomic<int> refs{0};
+    std::vector<uint8_t> data;
 };
 struct PendingWriteBack {
     const void* dest;
     uint32_t bytes;
     uint64_t hash;
-    GLuint pbo;
-    GLsync fence;
-    uint32_t readBytes;  // the pixel buffer's size
-    uint32_t frame;
-    bool cancelled;
-    WbFetch* fetch;      // the GL thread's read of it, or null
+    uint64_t seq;
+    int rowOffset;
+    WbBatch* batch;
+    bool cancelled = false;
+    bool landed = false;
 };
+static std::deque<WbBatch> s_wbPool;
+static std::vector<WbBatch*> s_wbBatchFree;
+static WbBatch* s_wbOpen = nullptr;
+static std::vector<WbBatch*> s_wbClosed;
+static double s_wbLastAdd = 0;
 static std::vector<PendingWriteBack> s_writeBacks;
-static std::vector<GLuint> s_freePbos;
+static uint64_t s_wbSeq = 0;
+enum { kWbBytesPerRow = 1024, kMaxWbBatchRows = 1024 };
 
-static void resolveWriteBack(PendingWriteBack& w) {
-    if (w.fetch) {
-        {
-            GxTimer tw(&s_waitSeconds);
-            glt::waitFlag(w.fetch->ready);
+static std::mutex s_wbUnmapMutex;
+static std::vector<std::pair<GLuint, GLsizeiptr>> s_wbToUnmap;
+static std::mutex s_wbFreeMutex;
+static std::vector<std::pair<GLuint, GLsizeiptr>> s_wbUnmapped;
+static std::vector<std::pair<GLuint, GLsizeiptr>> s_wbPboFree;
+
+struct WbCopyOut {
+    const uint8_t* mapped;
+    uint8_t* dst;
+    size_t bytes;
+    GLuint pbo;
+    std::atomic<int>* copied;
+};
+static struct {
+    std::thread thread;
+    std::mutex mutex;
+    std::condition_variable wake;
+    std::deque<WbCopyOut> queue;
+    bool stopping = false;
+} s_wbCopier;
+
+static void startWbCopier() {
+    if (!glt::active() || s_wbCopier.thread.joinable()) return;
+    s_wbCopier.stopping = false;
+    s_wbCopier.thread = std::thread([] {
+        for (;;) {
+            WbCopyOut job;
+            {
+                std::unique_lock<std::mutex> lock(s_wbCopier.mutex);
+                s_wbCopier.wake.wait(lock, [] { return s_wbCopier.stopping || !s_wbCopier.queue.empty(); });
+                if (s_wbCopier.stopping && s_wbCopier.queue.empty()) return;
+                job = s_wbCopier.queue.front();
+                s_wbCopier.queue.pop_front();
+            }
+            memcpy(job.dst, job.mapped, job.bytes);
+            {
+                std::lock_guard<std::mutex> hold(s_wbUnmapMutex);
+                s_wbToUnmap.push_back({job.pbo, GLsizeiptr(job.bytes)});
+            }
+            glt::signalFlag(*job.copied);
         }
-        if (!w.cancelled && w.fetch->ok && hashBytes(w.dest, w.bytes) == w.hash)
-            storeEncoded(w.fetch->bytes.data(), w.dest, w.bytes);
-        delete w.fetch;
-        w.fetch = nullptr;
-    } else if (!w.cancelled && hashBytes(w.dest, w.bytes) == w.hash) {
-        const void* px;
-        {
-            GxTimer tw(&s_waitSeconds);
-            glClientWaitSync(w.fence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull);
-            glBindBuffer(GL_PIXEL_PACK_BUFFER, w.pbo);
-            px = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, GLsizeiptr(w.readBytes), GL_MAP_READ_BIT);
-        }
-        if (px) storeEncoded(static_cast<const uint8_t*>(px), w.dest, w.bytes);
-        glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
-        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
-    }
-    glDeleteSync(w.fence);
-    s_freePbos.push_back(w.pbo);
+    });
 }
 
-// Stores the write-backs issued before this frame (all of them with `all`).
-static void resolveWriteBacks(bool all) {
-    size_t keep = 0;
+static void stopWbCopier() {
+    if (!s_wbCopier.thread.joinable()) return;
+    {
+        std::lock_guard<std::mutex> lock(s_wbCopier.mutex);
+        s_wbCopier.stopping = true;
+    }
+    s_wbCopier.wake.notify_all();
+    s_wbCopier.thread.join();
+}
+
+static void wbDrainUnmaps() {
+    std::vector<std::pair<GLuint, GLsizeiptr>> got;
+    {
+        std::lock_guard<std::mutex> hold(s_wbUnmapMutex);
+        got.swap(s_wbToUnmap);
+    }
+    if (got.empty()) return;
+    GLint prev = 0;
+    glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &prev);
+    for (const auto& u : got) {
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, u.first);
+        glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+    }
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, GLuint(prev));
+    std::lock_guard<std::mutex> hold(s_wbFreeMutex);
+    for (const auto& u : got) s_wbUnmapped.push_back(u);
+}
+
+static void wbReclaimPbos() {
+    std::vector<std::pair<GLuint, GLsizeiptr>> got;
+    {
+        std::lock_guard<std::mutex> hold(s_wbFreeMutex);
+        got.swap(s_wbUnmapped);
+    }
+    for (const auto& u : got) s_wbPboFree.push_back(u);
+}
+
+static WbBatch* openWbBatch() {
+    WbBatch* b;
+    if (!s_wbBatchFree.empty()) {
+        b = s_wbBatchFree.back();
+        s_wbBatchFree.pop_back();
+    } else {
+        s_wbPool.emplace_back();
+        b = &s_wbPool.back();
+    }
+    b->pbo = 0;
+    b->sized = false;
+    b->rows = 0;
+    b->fence = nullptr;
+    b->copied.store(0, std::memory_order_relaxed);
+    b->dropped.store(0, std::memory_order_relaxed);
+    b->collectQueued.store(0, std::memory_order_relaxed);
+    b->handed.store(0, std::memory_order_relaxed);
+    b->mapped.store(0, std::memory_order_relaxed);
+    b->refs.store(0, std::memory_order_relaxed);
+    b->data.clear();
+    s_wbOpen = b;
+    return b;
+}
+
+static void recycleBatch(WbBatch* b) {
+    if (b->fence) {
+        glDeleteSync(b->fence);
+        b->fence = nullptr;
+    }
+    if (b->pbo && !b->mapped.load(std::memory_order_acquire)) {
+        s_wbPboFree.push_back({b->pbo, GLsizeiptr(b->rows) * kWbBytesPerRow});
+        b->pbo = 0;
+    }
+    s_wbBatchFree.push_back(b);
+}
+
+static void closeWbBatch(bool force) {
+    WbBatch* b = s_wbOpen;
+    if (!b) return;
+    const double now = monoSeconds();
+    if (!force && s_wbLastAdd > 0 && now - s_wbLastAdd < 0.002 && b->rows < kMaxWbBatchRows) return;
+    s_wbOpen = nullptr;
+    if (b->rows == 0) {
+        recycleBatch(b);
+        return;
+    }
+    const GLsizeiptr mapBytes = GLsizeiptr(b->rows) * kWbBytesPerRow;
+    for (size_t i = 0; i < s_wbPboFree.size(); i++) {
+        if (s_wbPboFree[i].second == mapBytes) {
+            b->pbo = s_wbPboFree[i].first;
+            b->sized = true;
+            s_wbPboFree.erase(s_wbPboFree.begin() + std::ptrdiff_t(i));
+            break;
+        }
+    }
+    if (!b->pbo) glGenBuffers(1, &b->pbo);
+    b->data.resize(size_t(mapBytes));
+    const GLuint pbo = b->pbo;
+    const bool sized = b->sized;
+    glt::post([pbo, sized, mapBytes] {
+        wbDrainUnmaps();
+        GLint prev = 0;
+        glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &prev);
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, pbo);
+        if (!sized) glBufferData(GL_PIXEL_PACK_BUFFER, mapBytes, nullptr, GL_STREAM_READ);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, s_encFbo);
+        glPixelStorei(GL_PACK_ALIGNMENT, 4);
+        glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+        glReadPixels(0, 0, 256, GLsizei(mapBytes / kWbBytesPerRow), GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, GLuint(prev));
+    });
+    b->fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    s_wbClosed.push_back(b);
+}
+
+static void wbMapAndHand(WbBatch* b) {
+    const GLsizeiptr mapBytes = GLsizeiptr(b->rows) * kWbBytesPerRow;
+    GLint prev = 0;
+    glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &prev);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, b->pbo);
+    const uint8_t* mapped = static_cast<const uint8_t*>(glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, mapBytes, GL_MAP_READ_BIT));
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, GLuint(prev));
+    if (!mapped) {
+        logmsg("texture copy write-back: pixel buffer map failed");
+        b->dropped.store(1, std::memory_order_release);
+        glt::signalFlag(b->copied);
+        return;
+    }
+    b->mapped.store(1, std::memory_order_release);
+    if (s_wbCopier.thread.joinable()) {
+        std::lock_guard<std::mutex> lock(s_wbCopier.mutex);
+        s_wbCopier.queue.push_back(WbCopyOut{mapped, b->data.data(), size_t(mapBytes), b->pbo, &b->copied});
+        s_wbCopier.wake.notify_one();
+    } else {
+        memcpy(b->data.data(), mapped, size_t(mapBytes));
+        {
+            std::lock_guard<std::mutex> hold(s_wbUnmapMutex);
+            s_wbToUnmap.push_back({b->pbo, mapBytes});
+        }
+        glt::signalFlag(b->copied);
+    }
+}
+
+static void wbCollectJob(WbBatch* b, bool force) {
+    wbDrainUnmaps();
+    b->collectQueued.store(0, std::memory_order_release);
+    if (b->copied.load(std::memory_order_acquire) || b->dropped.load(std::memory_order_acquire) || !b->fence) return;
+    const GLenum st = glClientWaitSync(b->fence, force ? GL_SYNC_FLUSH_COMMANDS_BIT : 0, force ? 1000000000ull : 0);
+    if (st != GL_ALREADY_SIGNALED && st != GL_CONDITION_SATISFIED) {
+        if (force) {
+            logmsg("texture copy write-back did not retire");
+            b->dropped.store(1, std::memory_order_release);
+            glt::signalFlag(b->copied);
+        }
+        return;
+    }
+    if (b->handed.exchange(1, std::memory_order_acq_rel)) return;
+    wbMapAndHand(b);
+}
+
+static bool wbResolve(PendingWriteBack& w, bool wait) {
+    WbBatch* b = w.batch;
+    if (!b->copied.load(std::memory_order_acquire) && !b->dropped.load(std::memory_order_acquire)) {
+        if (!wait) return false;
+        if (!b->fence) closeWbBatch(true);
+        s_wbWaits++;
+        if (glt::active() && !glt::onGlThread()) {
+            glt::sync([&] { wbCollectJob(b, true); });
+        } else {
+            wbCollectJob(b, true);
+        }
+        glt::waitFlag(b->copied);
+    }
+    w.landed = true;
+    b->refs.fetch_sub(1, std::memory_order_relaxed);
+    if (b->dropped.load(std::memory_order_acquire)) {
+        s_wbDrops++;
+        return false;
+    }
+    if (hashBytes(w.dest, w.bytes) != w.hash) {
+        s_wbDrops++;
+        return false;
+    }
+    storeEncoded(b->data.data() + size_t(w.rowOffset) * kWbBytesPerRow, w.dest, w.bytes);
+    s_wbLands++;
+    return true;
+}
+
+void serviceWriteBacksThrough(uint64_t through, bool wait) {
+    startWbCopier();
+    wbReclaimPbos();
+    if (!glt::active()) wbDrainUnmaps();
+    closeWbBatch(false);
+    for (WbBatch* b : s_wbClosed) {
+        if (b->refs.load(std::memory_order_relaxed) == 0 || b->copied.load(std::memory_order_acquire) ||
+            b->dropped.load(std::memory_order_acquire))
+            continue;
+        if (wait) {
+            glt::sync([&] { wbCollectJob(b, true); });
+            glt::waitFlag(b->copied);
+        } else if (!b->collectQueued.exchange(1, std::memory_order_acq_rel)) {
+            glt::post([b] { wbCollectJob(b, false); });
+        }
+    }
     for (size_t i = 0; i < s_writeBacks.size(); i++) {
         PendingWriteBack& w = s_writeBacks[i];
-        if (!all && !w.cancelled && w.frame >= s_frameNo) s_writeBacks[keep++] = w;
-        else resolveWriteBack(w);
+        if (w.cancelled || w.landed || w.seq > through) continue;
+        if (!wbResolve(w, wait) && !wait) break;
     }
+    size_t keep = 0;
+    for (size_t i = 0; i < s_writeBacks.size(); i++)
+        if (!s_writeBacks[i].landed) s_writeBacks[keep++] = s_writeBacks[i];
     s_writeBacks.resize(keep);
+    for (size_t i = 0; i < s_wbClosed.size(); i++) {
+        WbBatch* b = s_wbClosed[i];
+        if (b->refs.load(std::memory_order_relaxed) != 0) continue;
+        if (!b->copied.load(std::memory_order_acquire) && !b->dropped.load(std::memory_order_acquire) &&
+            b->collectQueued.load(std::memory_order_acquire))
+            continue;
+        recycleBatch(b);
+        s_wbClosed.erase(s_wbClosed.begin() + std::ptrdiff_t(i));
+        i--;
+    }
 }
 
-// tw x th: the copy's size in texels as the game sees it.
+void serviceWriteBacks(bool wait) { serviceWriteBacksThrough(s_wbSeq, wait); }
+
 static void writeBackCopy(const void* dest, GLuint tex, int ow, int oh, int tw, int th, const CopyMap& map,
                           uint32_t layout) {
     if (!dest || !copyWriteBackEnabled()) return;
@@ -2904,78 +3203,42 @@ static void writeBackCopy(const void* dest, GLuint tex, int ow, int oh, int tw, 
     uint32_t bytes = texLevelBytes(layout, uint32_t(tw), uint32_t(th));
     if (!bytes) return;
     efbCopySetBytes(dest, bytes);
-    const int rows = encodeCopy(tex, ow, oh, tw, th, map, layout, bytes);
-    const uint32_t readBytes = uint32_t(rows) * 1024;
     if (!asyncReads() || copyVerify()) {
         static std::vector<uint8_t> px;
-        px.resize(readBytes);
+        const int rows = encodeCopy(tex, ow, oh, tw, th, map, layout, bytes, 0);
+        px.resize(size_t(rows) * kWbBytesPerRow);
         glReadPixels(0, 0, 256, rows, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
         if (copyVerify()) verifyEncode(tex, ow, oh, tw, th, map, layout, px.data(), bytes);
         if (!asyncReads()) {
             s_syncReads++;
             storeEncoded(px.data(), dest, bytes);
-            return;
         }
+        return;
     }
-    // A copy to the same place supersedes one of this frame; one from an
-    // earlier frame (most games copy to the same buffer every frame) is
-    // stored first, as the CPU may have read it in between.
-    size_t keep = 0;
-    for (size_t i = 0; i < s_writeBacks.size(); i++) {
-        PendingWriteBack& w = s_writeBacks[i];
-        if (w.dest != dest) s_writeBacks[keep++] = w;
-        else if (w.frame < s_frameNo) resolveWriteBack(w);
-        else {
-            w.cancelled = true;
-            resolveWriteBack(w);
-        }
+    serviceWriteBacksThrough(0, false);
+    uint64_t earlier = 0;
+    for (const PendingWriteBack& w : s_writeBacks)
+        if (!w.cancelled && !w.landed && w.dest == dest) earlier = w.seq;
+    if (earlier) serviceWriteBacksThrough(earlier, true);
+    const int rows = int((bytes + kWbBytesPerRow - 1) / kWbBytesPerRow);
+    WbBatch* b = s_wbOpen;
+    if (!b || b->rows + rows > kMaxWbBatchRows || b->rows + rows > s_encRows) {
+        closeWbBatch(true);
+        b = openWbBatch();
+        s_wbLastAdd = 0;
     }
-    s_writeBacks.resize(keep);
-    GLuint pbo;
-    if (!s_freePbos.empty()) {
-        pbo = s_freePbos.back();
-        s_freePbos.pop_back();
-    } else {
-        glGenBuffers(1, &pbo);
-    }
-    glBindBuffer(GL_PIXEL_PACK_BUFFER, pbo);
-    glBufferData(GL_PIXEL_PACK_BUFFER, GLsizeiptr(readBytes), nullptr, GL_STREAM_READ);
-    glReadPixels(0, 0, 256, rows, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
-    PendingWriteBack w{dest, bytes, hashBytes(dest, bytes), pbo, glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0),
-                       readBytes, s_frameNo, false, nullptr};
+    PendingWriteBack w{};
+    w.dest = dest;
+    w.bytes = bytes;
+    w.hash = hashBytes(dest, bytes);
+    w.seq = ++s_wbSeq;
+    w.rowOffset = b->rows;
+    w.batch = b;
+    encodeCopy(tex, ow, oh, tw, th, map, layout, bytes, b->rows);
+    b->rows += rows;
+    b->refs.fetch_add(1, std::memory_order_relaxed);
+    s_wbLastAdd = monoSeconds();
     s_writeBacks.push_back(w);
-}
-
-// The GL thread waits for the GPU's copies and reads them as soon as the frame
-// that made them is shown, while the game goes on (see gx_glthread.h).
-static void bindPack(GLuint pbo, GLint* prev) {  // on the GL thread
-    if (prev) glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, prev);
-    glBindBuffer(GL_PIXEL_PACK_BUFFER, pbo);
-}
-
-static void prefetchWriteBacks() {
-    for (PendingWriteBack& w : s_writeBacks) {
-        if (w.fetch || w.cancelled) continue;
-        WbFetch* f = new WbFetch;
-        f->bytes.resize(w.bytes);
-        const GLsync fence = w.fence;
-        const GLuint pbo = w.pbo;
-        const uint32_t n = w.bytes;
-        glt::post([=] {
-            glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull);
-            GLint prev = 0;
-            bindPack(pbo, &prev);
-            if (const void* px = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, GLsizeiptr(n), GL_MAP_READ_BIT)) {
-                memcpy(f->bytes.data(), px, n);
-                f->ok = true;
-                glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
-            }
-            bindPack(GLuint(prev), nullptr);
-            glt::signalFlag(f->ready);
-        });
-        w.fetch = f;
-    }
 }
 
 static void prefetchPeeks();
@@ -3156,7 +3419,7 @@ static void copyEfb(uint32_t ctrl) {
     glBindFramebuffer(GL_FRAMEBUFFER, s_efbFbo);
     if (clear) s_drawGen++;
     if (disp) {
-        resolveWriteBacks(false);
+        serviceWriteBacks(true);
         hiresEndFrame();
         s_frameNo++;
         g_displayFrames++;
@@ -3181,7 +3444,6 @@ void executeCopy(uint32_t ctrl) {
     // presenting (the hook) is timed apart from sms_gx: GXPC_GetTimes
     if (disp && g_displayCopyHook) g_displayCopyHook(dest);
     if (disp && glt::active()) {  // the frame is shown: the GL thread reads its results (see gx_glthread.h)
-        prefetchWriteBacks();
         prefetchPeeks();
         prefetchMetrics();
     }
@@ -3226,6 +3488,8 @@ void GXPC_PrepareStage(int stage) {
 
 void GXPC_Shutdown(void) {
     if (!s_ready) return;
+    serviceWriteBacks(true);
+    stopWbCopier();
     textureShutdown();
     shaderShutdown();
     for (int i = 0; i < OVERLAY_SLOTS; i++) {
@@ -3284,6 +3548,11 @@ static void takeFetchedPeek(PeekSnap& p) {
 
 // Maps the snapshots of the frame just shown on the GL thread, which waits
 // for the GPU there instead of the game at its next peek.
+static void bindPack(GLuint pbo, GLint* prev) {
+    if (prev) glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, prev);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, pbo);
+}
+
 static void prefetchPeeks() {
     const uint32_t frame = s_frameNo - 1;
     const GLsizeiptr bytes = GLsizeiptr(s_efbW) * EFB_H * 4;
